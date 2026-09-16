@@ -37,6 +37,19 @@ jobs:
           python-version: "3.12"
       - run: pip install -e .
 
+      - name: actionlint, because this file broke once already
+        # A `${{` inside a comment in a `run:` block is still an expression to
+        # GitHub, and an unbalanced one stops the workflow compiling — no jobs,
+        # no logs, just a failed run. actionlint catches it and blankout does
+        # not, which is the honest division of labour between the two.
+        # SC2016 is ignored because the scratch files below deliberately keep
+        # their `$` unexpanded.
+        run: |
+          curl -sSL -o actionlint.tgz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          tar xzf actionlint.tgz actionlint
+          ./actionlint -ignore 'SC2016'
+
       - name: our own workflows read no output that is never written
         run: blankout
 
@@ -73,9 +86,11 @@ jobs:
               steps:
                 - run: echo publishing
           YAML
-          # GitHub substitutes `${{` in a `run:` block before bash sees it, and
-          # a quoted heredoc does not help because the rewrite happens first.
-          # So the braces go in afterwards.
+          # GitHub substitutes expressions in a `run:` block before bash ever
+          # sees it, and a quoted heredoc does not help because the rewrite
+          # happens first. So the braces go in afterwards. This comment cannot
+          # spell the opening delimiter either: GitHub reads comments too, and
+          # an unbalanced one here stops the whole workflow compiling.
           sed -i 's/\${BRACE}/${''{/' /tmp/broken/.github/workflows/ci.yml
           grep -qF '${'"{"' steps.check.outputs.release }}' /tmp/broken/.github/workflows/ci.yml \
             || { cat /tmp/broken/.github/workflows/ci.yml; echo "scratch file was rewritten"; exit 1; }
