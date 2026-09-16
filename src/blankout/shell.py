@@ -83,6 +83,22 @@ class Writes:
     opaque: str | None = None
     #: True if GITHUB_OUTPUT or set-output appears anywhere in the script.
     mentions: bool = False
+    #: True if the script contains a `${{ }}`, which is substituted into the
+    #: text before bash ever sees it. See `writes_nothing`.
+    interpolated: bool = False
+
+    @property
+    def writes_nothing(self) -> bool:
+        """Whether this script can be said to publish no outputs at all.
+
+        That claim rests on the absence of something, and an interpolation is
+        exactly the thing that can supply it: `${{ }}` is textual substitution
+        performed before the shell runs, so a value carrying a `;` becomes a
+        command. So a script with any interpolation in it never gets this
+        verdict, even though it may still get `wrong-key` — that one rests on
+        what the script visibly does rather than on what it does not.
+        """
+        return self.decided and not self.mentions and not self.interpolated
 
     @property
     def decided(self) -> bool:
@@ -141,11 +157,11 @@ def _strip_comment(line: str) -> str:
 
 
 def _split_commands(line: str) -> list[str]:
-    """Break one line into commands on `;`, `&&` and `||`, outside quotes.
+    """Break one line into commands on `;`, `&&`, `||` and `|`, outside quotes.
 
-    Pipes are deliberately not split on: `echo x | tee $GITHUB_OUTPUT` is one
-    command as far as "what does it write" is concerned, and the redirection
-    target lives at the end of it.
+    Pipes count because what matters about a segment is what starts it: the
+    right-hand side of a pipe is a command position, and a `${{ }}` sitting in
+    one is somebody else's script.
     """
     parts, buf, quote, i = [], [], None, 0
     while i < len(line):
@@ -170,6 +186,11 @@ def _split_commands(line: str) -> list[str]:
             parts.append("".join(buf))
             buf = []
             i += 2
+            continue
+        if ch == "|":
+            parts.append("".join(buf))
+            buf = []
+            i += 1
             continue
         buf.append(ch)
         i += 1
@@ -284,6 +305,7 @@ def scan_script(script: str, shell: str | None) -> Writes:
     """
     writes = Writes()
     writes.mentions = "GITHUB_OUTPUT" in script or "set-output" in script
+    writes.interpolated = "${{" in script
 
     if shell is not None and shell not in POSIX_SHELLS:
         if writes.mentions:
@@ -340,6 +362,17 @@ def scan_script(script: str, shell: str | None) -> Writes:
                 continue
             total += cmd.count("GITHUB_OUTPUT")
             name = _unquote(toks[0]).rsplit("/", 1)[-1]
+
+            if toks[0].startswith("${{") or name.startswith("${{"):
+                # The command itself is an expression: `run: ${{ inputs.cmd }}`
+                # is a reusable workflow running a script its caller passed in,
+                # and nothing here knows what that script does. next.js does
+                # exactly this and its outputs are real.
+                writes.opaque = (
+                    "the step's command is a `${{ }}` expression, so the script "
+                    "is whatever the caller passes in"
+                )
+                return writes
 
             if _redirects_to_output(toks):
                 placed += cmd.count("GITHUB_OUTPUT")

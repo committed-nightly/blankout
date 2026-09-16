@@ -390,3 +390,93 @@ def test_a_bracket_subscript_is_the_same_reference(repo):
     )
     report = run(repo)
     assert [f.kind for f in report.findings] == [WRONG_KEY]
+
+
+def test_a_caller_supplied_script_is_declined(repo):
+    """next.js does this: `run:` is an expression, and the outputs are real."""
+    repo.write(
+        "reusable.yml",
+        """
+        name: Reusable
+        on:
+          workflow_call:
+            inputs:
+              afterBuild:
+                type: string
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            steps:
+              - id: after-build
+                run: ${{ inputs.afterBuild }}
+              - if: steps.after-build.outputs.passed_tests_file != ''
+                run: echo saving
+        """,
+    )
+    report = run(repo)
+    assert report.findings == []
+    assert "whatever the caller passes in" in report.undecided[0].reason
+
+
+def test_an_interpolated_value_withholds_never_writes(repo):
+    """A `${{ }}` is substituted in before bash runs and could carry a write."""
+    repo.write(
+        "ci.yml",
+        """
+        name: CI
+        on: push
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            outputs:
+              v: ${{ steps.m.outputs.version }}
+            steps:
+              - id: m
+                run: echo "building ${{ github.event.head_commit.message }}"
+        """,
+    )
+    report = run(repo)
+    assert report.findings == []
+    assert "substituted in before" in report.undecided[0].reason
+
+
+def test_an_interpolated_value_does_not_withhold_wrong_key(repo):
+    """That verdict rests on what the script does, not on what it omits."""
+    repo.write(
+        "ci.yml",
+        """
+        name: CI
+        on: push
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            outputs:
+              v: ${{ steps.m.outputs.verison }}
+            steps:
+              - id: m
+                run: echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
+        """,
+    )
+    report = run(repo)
+    assert [f.kind for f in report.findings] == [WRONG_KEY]
+
+
+def test_an_expression_after_a_pipe_is_still_a_command(repo):
+    repo.write(
+        "ci.yml",
+        """
+        name: CI
+        on: push
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            outputs:
+              v: ${{ steps.m.outputs.version }}
+            steps:
+              - id: m
+                run: cat notes.txt | ${{ inputs.filter }}
+        """,
+    )
+    report = run(repo)
+    assert report.findings == []
+    assert "caller passes in" in report.undecided[0].reason

@@ -128,6 +128,12 @@ def _verdict(job: Job, step_id: str, key: str) -> tuple[str | None, str]:
     if writes.unknown:
         return None, f"{where} writes an output whose name this could not read"
     if not writes.mentions:
+        if not writes.writes_nothing:
+            return None, (
+                f"{where} writes no outputs in the text of its script, but the "
+                f"script contains a `${{{{ }}}}` that is substituted in before "
+                f"bash runs, and could carry one"
+            )
         return NEVER_WRITES, (
             f"{where} never writes to $GITHUB_OUTPUT, so it publishes no outputs"
         )
