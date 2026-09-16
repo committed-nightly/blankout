@@ -59,7 +59,7 @@ WRITES = [
 #: Scripts that write nothing at all and can be said to write nothing.
 WRITES_NOTHING = [
     'echo "building"',
-    "make -v || true" if False else "grep -c x file.txt",
+    "grep -c x file.txt",
     'if [ -f VERSION ]; then echo "found"; fi',
     "git log --oneline -1\ncurl -sS https://example.com -o out.json",
     # A heredoc to somewhere else: its body is content, not commands.
@@ -73,6 +73,10 @@ UNDECIDABLE = [
     'echo "${PREFIX}_sha=abc" >> $GITHUB_OUTPUT',
     # A local script inherits the env var and knows the protocol.
     "./scripts/release.sh",
+    # An interpreter fed by a heredoc. transformers sets three outputs this
+    # way, and the heredoc body is not shell for this scanner to read.
+    'python3 - <<\'EOF\'\nimport os\nwith open(os.environ["GITHUB_OUTPUT"], "a") as f:\n    f.write("matrix=[]\\n")\nEOF',
+    "node <<'EOF'\nconsole.log('hi')\nEOF",
     "bash scripts/release.sh",
     "python -c 'import os; open(os.environ[\"GITHUB_OUTPUT\"], \"a\")'",
     "make release",
@@ -116,6 +120,27 @@ def test_scripts_that_write_nothing(script):
 def test_undecidable_scripts_decline(script):
     writes = scan_script(script, "bash")
     assert not writes.decided, f"claimed to decide: {script!r} -> {writes.keys}"
+
+
+def test_a_heredoc_to_an_interpreter_names_the_interpreter():
+    """Found in transformers: the heredoc branch skipped the opacity check,
+    so three outputs written by the Python on stdin were called missing."""
+    writes = scan_script(
+        'python3 - <<\'EOF\'\nimport os\n'
+        'open(os.environ["GITHUB_OUTPUT"], "a").write("a=1")\nEOF',
+        "bash",
+    )
+    assert not writes.decided
+    assert "python3" in (writes.opaque or "")
+
+
+def test_a_heredoc_to_a_file_still_counts_its_mentions():
+    """A script written to disk now is a script that may be run later."""
+    writes = scan_script(
+        "cat > emit.sh <<'EOF'\necho a=1 >> $GITHUB_OUTPUT\nEOF\nchmod +x emit.sh",
+        "bash",
+    )
+    assert not writes.decided
 
 
 def test_opaque_reason_names_the_command():

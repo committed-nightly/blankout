@@ -350,6 +350,22 @@ def scan_script(script: str, shell: str | None) -> Writes:
                     writes.unknown = True
                 else:
                     _keys_from_body(body, writes)
+                continue
+
+            # The heredoc feeds something else, and that something else is a
+            # command like any other. `python3 - <<'EOF'` is how transformers
+            # sets three outputs, and skipping the opacity check here read the
+            # whole thing as a step that writes nothing.
+            reason = _opacity(toks)
+            if reason:
+                writes.opaque = reason
+                return writes
+
+            # Whatever the body is, it is not commands this scanner ran, but a
+            # mention of the output file in it is still a mention: a script
+            # being written to disk now is a script that may be run later.
+            total += sum(line.count("GITHUB_OUTPUT") for line in body)
+            total += opener.count("GITHUB_OUTPUT")
             continue
 
         line = opener
@@ -401,11 +417,9 @@ def scan_script(script: str, shell: str | None) -> Writes:
                     writes.keys.add(m.group(1))
                 continue
 
-            if name in OPAQUE_COMMANDS or _looks_like_path(toks[0]):
-                writes.opaque = (
-                    f"the step runs `{_unquote(toks[0])}`, which could write "
-                    f"outputs this cannot see"
-                )
+            reason = _opacity(toks)
+            if reason:
+                writes.opaque = reason
                 return writes
 
     if output_delim is not None:
@@ -438,6 +452,17 @@ def _keys_from_body(body: list[str], writes: Writes) -> None:
             delim = line.split("<<", 1)[1].strip()
     if delim is not None:
         writes.unknown = True
+
+
+def _opacity(toks: list[str]) -> str | None:
+    """Why this command ends the analysis, or None if it does not."""
+    if not toks:
+        return None
+    first = _unquote(toks[0])
+    name = first.rsplit("/", 1)[-1]
+    if name in OPAQUE_COMMANDS or _looks_like_path(toks[0]):
+        return f"the step runs `{first}`, which could write outputs this cannot see"
+    return None
 
 
 def _looks_like_path(tok: str) -> bool:
