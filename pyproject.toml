@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blankout"
+version = "0.1.0"
+description = "Find the GitHub Actions step outputs that are always empty."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["github-actions", "workflows", "ci", "outputs", "linter", "devops"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Build Tools",
+]
+dependencies = ["PyYAML>=5.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+blankout = "blankout.cli:main"
+
+[project.urls]
+Source = "https://github.com/committed-nightly/blankout"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/blankout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
