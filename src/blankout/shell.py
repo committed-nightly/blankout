@@ -15,8 +15,8 @@ answers trustworthy rather than merely usually right:
 Nothing is inferred from a mention it could not place. A script that does
 `OUT=$GITHUB_OUTPUT` and then writes to `$OUT` is not parsed; it is refused,
 by name, because the alternative is to claim the step writes nothing and be
-confidently wrong. The counter is `unplaced` and the check that enforces it is
-at the bottom of `scan_script`.
+confidently wrong. The counters are `total` and `placed`, and the check that
+enforces the rule is the `placed < total` at the bottom of `scan_script`.
 
 The second way to be confidently wrong is subtler and it is the reason for
 `OPAQUE_COMMANDS`. A script that says only
@@ -65,7 +65,7 @@ OPAQUE_COMMANDS = {
 #: still be asked the weaker question "does it mention GITHUB_OUTPUT at all".
 POSIX_SHELLS = {"bash", "sh", "dash", "zsh"}
 
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_HEREDOC = re.compile(r"^<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _SET_OUTPUT = re.compile(r"::\s*set-output\s+name\s*=\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*::")
 _DYNAMIC = re.compile(r"[$`]|\$\{\{")
 
@@ -88,6 +88,34 @@ class Writes:
     def decided(self) -> bool:
         """Whether this script can answer "is key K missing?" for any K."""
         return self.opaque is None and not self.unknown
+
+
+def _heredoc_delimiter(line: str) -> str | None:
+    """The delimiter of a heredoc this line opens, if it opens one.
+
+    Quote-aware, and it has to be: `echo "notes<<EOF" >> $GITHUB_OUTPUT` is the
+    first line of GitHub's own multi-line output protocol, and it contains a
+    `<<EOF` that is text rather than a redirection. Reading it as a heredoc
+    swallows the rest of the script.
+    """
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if line[i : i + 2] == "<<":
+            match = _HEREDOC.match(line[i:])
+            return match.group(2) if match else None
+        i += 1
+    return None
 
 
 def _strip_comment(line: str) -> str:
@@ -207,17 +235,23 @@ def _key_from_line(text: str) -> tuple[str | None, bool]:
     text = text.strip()
     if not text:
         return None, False
-    for sep, heredoc in (("<<", True), ("=", False)):
-        head, found, _ = text.partition(sep)
-        if not found:
-            continue
-        head = head.strip()
-        if not head or _DYNAMIC.search(head):
-            return None, heredoc
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", head):
-            return head, heredoc
+    # Whichever separator comes first wins. `notes<<EOF` opens a block;
+    # `cmd=git log a<<b` is an ordinary key whose value happens to contain
+    # angle brackets, and reading that as a block would swallow the script.
+    at_heredoc = text.find("<<")
+    at_equals = text.find("=")
+    if at_heredoc == -1 and at_equals == -1:
+        return None, False
+    if at_equals == -1 or (at_heredoc != -1 and at_heredoc < at_equals):
+        head, heredoc = text[:at_heredoc], True
+    else:
+        head, heredoc = text[:at_equals], False
+    head = head.strip()
+    if not head or _DYNAMIC.search(head):
         return None, heredoc
-    return None, False
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", head):
+        return head, heredoc
+    return None, heredoc
 
 
 def _echoed_text(toks: list[str]) -> str | None:
@@ -257,8 +291,10 @@ def scan_script(script: str, shell: str | None) -> Writes:
             writes.opaque = f"the step runs under `{shell}`, not a POSIX shell"
         return writes
 
-    # Every mention has to be accounted for by the end. Count them first.
-    total = script.count("GITHUB_OUTPUT")
+    # Every mention has to be accounted for by the end. Both counters only
+    # ever see command text: a mention in a comment, or in the body of a
+    # heredoc going somewhere else, is not a command and is not counted.
+    total = 0
     placed = 0
     # Set while a `name<<EOF` block is being written to the output file one
     # `echo` at a time, to the delimiter that will close it. Lines written
@@ -270,13 +306,13 @@ def scan_script(script: str, shell: str | None) -> Writes:
     while i < len(lines):
         raw = lines[i]
         i += 1
-        stripped = raw.strip()
 
         # A heredoc body belongs to the command that opened it, never to this
         # loop. Consume it here so its contents are never read as commands.
-        heredoc = _HEREDOC.search(_strip_comment(raw))
-        if heredoc:
-            delim = heredoc.group(2)
+        opener = _strip_comment(raw)
+        delim = _heredoc_delimiter(opener)
+        if delim:
+            total += opener.count("GITHUB_OUTPUT")
             body, closed = [], False
             while i < len(lines):
                 if lines[i].strip() == delim:
@@ -285,16 +321,16 @@ def scan_script(script: str, shell: str | None) -> Writes:
                     break
                 body.append(lines[i])
                 i += 1
-            toks = _tokens(_strip_comment(raw))
+            toks = _tokens(opener)
             if _redirects_to_output(toks):
-                placed += raw.count("GITHUB_OUTPUT")
+                placed += opener.count("GITHUB_OUTPUT")
                 if not closed:
                     writes.unknown = True
                 else:
                     _keys_from_body(body, writes)
             continue
 
-        line = _strip_comment(raw)
+        line = opener
         if not line.strip():
             continue
 
@@ -302,6 +338,7 @@ def scan_script(script: str, shell: str | None) -> Writes:
             toks = _tokens(cmd)
             if not toks:
                 continue
+            total += cmd.count("GITHUB_OUTPUT")
             name = _unquote(toks[0]).rsplit("/", 1)[-1]
 
             if _redirects_to_output(toks):
