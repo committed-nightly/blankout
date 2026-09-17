@@ -131,6 +131,37 @@ jobs:
           grep -q '^not checked:' /tmp/reusable.txt \
             || { echo "declined silently, or did not decline"; exit 1; }
 
+      - name: a script behind a `FOO=bar` is declined, not called empty
+        # The false positive found in review. `FOO=bar ./release.sh` runs
+        # `./release.sh`; the opacity check used to read the first word, and
+        # the first word is the assignment.
+        run: |
+          mkdir -p /tmp/prefixed/.github/workflows
+          cat > /tmp/prefixed/.github/workflows/ci.yml <<'YAML'
+          name: Release
+          on: [push]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              outputs:
+                version: ${BRACE} steps.v.outputs.version }}
+              steps:
+                - id: v
+                  run: FOO=bar ./release.sh
+            use:
+              needs: build
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo ${BRACE} needs.build.outputs.version }}
+          YAML
+          sed -i 's/\${BRACE}/${''{/' /tmp/prefixed/.github/workflows/ci.yml
+
+          code=0; blankout /tmp/prefixed > /tmp/prefixed.txt || code=$?
+          cat /tmp/prefixed.txt
+          test "$code" -eq 0 || { echo "expected exit 0, got $code"; exit 1; }
+          grep -q 'not checked:.*`\./release\.sh`' /tmp/prefixed.txt \
+            || { echo "declined for the wrong reason, or did not decline"; exit 1; }
+
       - name: a directory with no workflows is an error, not a pass
         run: |
           mkdir -p /tmp/empty
