@@ -54,6 +54,18 @@ WRITES = [
         "cat >> $GITHUB_OUTPUT <<EOF\nnotes<<BODY\nnot=a=key\nBODY\nn=1\nEOF",
         {"notes", "n"},
     ),
+    # A leading assignment sets the environment; the command is what follows,
+    # and it is still an `echo` whose key can be read.
+    ('TZ=UTC echo "version=1.2" >> $GITHUB_OUTPUT', {"version"}),
+    ('LC_ALL=C LANG=C echo "a=1" >> $GITHUB_OUTPUT', {"a"}),
+    ('FOO="a b" echo "a=1" >> $GITHUB_OUTPUT', {"a"}),
+    ('CI=true echo "::set-output name=version::1.2"', {"version"}),
+    # An assignment on its own line runs nothing, and the echo after it is
+    # read as normal.
+    ('VERSION=1.2\necho "v=$VERSION" >> $GITHUB_OUTPUT', {"v"}),
+    # A variable may be named after a command. Position decides which it is,
+    # so this is an assignment to `env` and not a run of `env`.
+    ('env=production echo "a=1" >> $GITHUB_OUTPUT', {"a"}),
 ]
 
 #: Scripts that write nothing at all and can be said to write nothing.
@@ -89,6 +101,20 @@ UNDECIDABLE = [
     "{\n  echo a=1\n  echo b=2\n} >> $GITHUB_OUTPUT",
     # A multi-line value whose delimiter never arrives.
     'echo "notes<<EOF" >> $GITHUB_OUTPUT\necho "body" >> $GITHUB_OUTPUT',
+    # The same opaque commands, behind a leading assignment. A shell runs the
+    # script either way, so declining either way is the only consistent answer.
+    "FOO=bar ./release.sh",
+    "GITHUB_TOKEN=x ./scripts/deploy.sh",
+    "CI=true npm test",
+    "VERSION=1 python3 script.py",
+    "LANG=C bash scripts/release.sh",
+    "NODE_ENV=production make release",
+    "DEBUG=1 FORCE_COLOR=0 ./build.sh",
+    # An assignment as an argument rather than a prefix: `make` is still what
+    # runs, and `make` is still opaque.
+    "make FOO=bar release",
+    # A heredoc fed to an interpreter that has one in front of it.
+    "PYTHONPATH=. python3 - <<'EOF'\nimport os\nEOF",
 ]
 
 
@@ -146,6 +172,136 @@ def test_a_heredoc_to_a_file_still_counts_its_mentions():
 def test_opaque_reason_names_the_command():
     writes = scan_script("./scripts/release.sh", "bash")
     assert "release.sh" in (writes.opaque or "")
+
+
+def test_an_env_prefixed_script_is_opaque_and_names_the_script():
+    """The false positive this tool exists not to have: `FOO=bar ./release.sh`
+    was read as a step that writes nothing, confidently, because the opacity
+    check only ever looked at the first word."""
+    writes = scan_script("FOO=bar ./release.sh", "bash")
+    assert not writes.decided
+    assert not writes.writes_nothing
+    assert "./release.sh" in (writes.opaque or "")
+    assert "FOO=bar" not in (writes.opaque or "")
+
+
+def test_an_assignment_is_only_an_assignment_in_front():
+    """`make FOO=bar` runs make. Stripping past the first non-assignment word
+    would lose the command and read this as a step that writes nothing."""
+    writes = scan_script("make FOO=bar release", "bash")
+    assert not writes.decided
+    assert "make" in (writes.opaque or "")
+
+
+def test_a_quoted_assignment_is_a_command_name():
+    """Which is why the match runs against the token with its quotes on: bash
+    answers `FOO=bar: command not found` here, and a command that never ran
+    wrote no outputs."""
+    writes = scan_script('"FOO=bar" hello', "bash")
+    assert writes.decided
+    assert writes.keys == set()
+
+
+def test_a_substitution_in_an_assignment_is_not_the_command():
+    """Found in grafana: `SHA=$(sha256sum pkg/server/wire_gen.go | cut -f1)`
+    stripped down to `pkg/server/wire_gen.go`, which is an argument inside the
+    substitution. A decline whose stated reason is untrue costs the same trust
+    a false positive does."""
+    writes = scan_script(
+        'SHA=$(sha256sum pkg/server/wire_gen.go | cut -d" " -f1)\n'
+        'echo "sha=$SHA" >> $GITHUB_OUTPUT',
+        "bash",
+    )
+    assert writes.decided, writes.opaque
+    assert writes.keys == {"sha"}
+
+
+def test_an_array_assignment_is_not_the_command():
+    """The same leak, spelled `FLAGS=(-l "release/latest")` — a bash array,
+    found in grafana's release-pr workflow."""
+    writes = scan_script(
+        'FLAGS=(-l "release/latest")\necho "a=1" >> $GITHUB_OUTPUT',
+        "bash",
+    )
+    assert writes.decided, writes.opaque
+    assert writes.keys == {"a"}
+
+
+def test_a_closed_substitution_still_leaves_the_command_visible():
+    """The guard must not give up on the ordinary case it sits in front of."""
+    writes = scan_script('VERSION=$(cat VERSION) ./release.sh', "bash")
+    assert not writes.decided
+    assert "./release.sh" in (writes.opaque or "")
+
+
+def test_a_script_run_inside_a_substitution_is_opaque():
+    """`V=$(./gen.sh -x)` runs `./gen.sh`, which inherits the env var like any
+    other. Found while checking the fix against deno, whose release workflow
+    does `DENO_VERSION=$(./deno -V | cut -d ' ' -f 2)`."""
+    for script in ("V=$(./gen.sh -x)", "V=$(./gen.sh)", "V=`./gen.sh`"):
+        writes = scan_script(script, "bash")
+        assert not writes.decided, script
+        assert "./gen.sh" in (writes.opaque or ""), script
+
+
+def test_a_substitution_that_cannot_write_is_left_alone():
+    """The point of naming commands rather than refusing all of them: `git`
+    will not go looking for the output file, so this step is still checkable."""
+    writes = scan_script(
+        'SHA=$(git rev-parse HEAD)\necho "sha=$SHA" >> $GITHUB_OUTPUT', "bash"
+    )
+    assert writes.decided, writes.opaque
+    assert writes.keys == {"sha"}
+
+
+def test_a_substitution_in_an_argument_is_not_treated_as_a_command():
+    """The deliberate asymmetry: an interpreter in the assignments in front of
+    a command ends the analysis, and the same interpreter in an argument does
+    not. Applying it everywhere costs far more steps their keys than the
+    false positives it would prevent, so this stays as it shipped."""
+    writes = scan_script('echo "x=$(node y.js)" >> $GITHUB_OUTPUT', "bash")
+    assert writes.decided, writes.opaque
+    assert writes.keys == {"x"}
+
+
+def test_a_single_quoted_substitution_does_not_run():
+    writes = scan_script("V='$(./gen.sh)' ./keep.sh", "bash")
+    assert "./keep.sh" in (writes.opaque or "")
+
+
+def test_a_command_name_with_a_space_in_it_is_not_a_command():
+    """Found in grafana: a `$( )` holding a pipe inside quotes puts this
+    module's quote tracking out of phase, and a whole fragment of a `sed`
+    lands where the command should be. Naming that in a decline is a reason
+    that is not true, so it is not a path and not a reason."""
+    writes = scan_script(
+        """OUT="$(echo x | while read -r line; do echo "- $line" | sed -E 's/a/b/g'; done)"\n"""
+        'echo "out=$OUT" >> $GITHUB_OUTPUT',
+        "bash",
+    )
+    assert "done)" not in (writes.opaque or "")
+
+
+def test_a_quoted_path_with_a_space_is_still_a_path():
+    """The other side of it: a real filename can contain a space, and one that
+    does arrives quoted whole."""
+    writes = scan_script('"./my scripts/release.sh"', "bash")
+    assert not writes.decided
+    assert "my scripts/release.sh" in (writes.opaque or "")
+
+
+def test_an_expression_command_behind_an_assignment_is_still_an_expression():
+    writes = scan_script("FOO=bar ${{ inputs.cmd }}", "bash")
+    assert not writes.decided
+    assert "caller passes in" in (writes.opaque or "")
+
+
+def test_a_bare_assignment_runs_nothing_but_still_counts_its_mention():
+    """`_strip_assignments` empties this line. The mention has to survive it,
+    or the rule the module is built on has a hole in it."""
+    writes = scan_script("OUT=$GITHUB_OUTPUT\necho a=1 >> $OUT", "bash")
+    assert not writes.decided
+    assert "could not read" in (writes.opaque or "")
 
 
 def test_unplaced_mention_is_the_catch_all():

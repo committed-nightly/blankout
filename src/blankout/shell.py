@@ -29,6 +29,21 @@ file two ways: a redirection, which is written down here and visible, or by
 opening the env var itself, which only a program written for Actions does. So
 any interpreter or local executable ends the analysis. `grep` and `git` and
 `curl` do not, because they will not go looking.
+
+The third way is to look in the wrong place for the command. `FOO=bar` in
+`FOO=bar ./release.sh` is not a command, it is an assignment the shell applies
+to the environment of the one that follows — and the one that follows is
+exactly the kind that ends the analysis. So the assignments in front are
+separated off before anything here asks what is being run, which is the order a
+real shell does it in. Separated rather than discarded, because a value can
+hold a command too: `V=$(./gen.sh)` runs `./gen.sh`.
+
+That last part stops where it is, deliberately. A substitution in the
+assignments in front of a command is read; one in an argument, as in
+`echo "x=$(node y.js)" >> $GITHUB_OUTPUT`, is not. Reading both would be the
+tidier rule, and against a corpus of 3,000 real `run:` steps it took thirty
+steps' keys away rather than twelve, to prevent false positives that appeared
+in none of them. Not answering is cheap here, but it is not free.
 """
 
 from __future__ import annotations
@@ -66,6 +81,7 @@ OPAQUE_COMMANDS = {
 POSIX_SHELLS = {"bash", "sh", "dash", "zsh"}
 
 _HEREDOC = re.compile(r"^<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SET_OUTPUT = re.compile(r"::\s*set-output\s+name\s*=\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*::")
 _DYNAMIC = re.compile(r"[$`]|\$\{\{")
 
@@ -222,6 +238,140 @@ def _tokens(cmd: str) -> list[str]:
     return toks
 
 
+def _split_assignments(toks: list[str]) -> tuple[list[str], list[str]]:
+    """Separate the leading `NAME=value` words from the command a shell runs.
+
+    `FOO=bar ./release.sh` runs `./release.sh` with `FOO` in its environment,
+    so the command to judge is the second word. Only *leading* words are
+    assignments: in `make FOO=bar` the assignment is an argument, which is why
+    this stops at the first word that is not one.
+
+    The match is against the token with its quotes still on, because quoting is
+    what decides this in a shell too: bash runs `"FOO=bar" echo hi` and reports
+    `FOO=bar: command not found`, the quotes having turned an assignment into a
+    command name.
+
+    The command comes back empty for a line that is only assignments. That is a
+    real thing a script does and it runs no command at all, so there is nothing
+    to judge — but the mention in `OUT=$GITHUB_OUTPUT` is still a mention, and
+    the caller counts it before calling this.
+
+    An assignment whose value opens a `$( )` or a `( )` spans the tokens up to
+    the one that closes it, because whitespace inside those does not end a word
+    in a shell — and it does end one here. Those are joined back up rather than
+    read one at a time: `VERSION=$(cat VERSION) ./release.sh` runs
+    `./release.sh`, and taking a token at a time would stop at `VERSION)` and
+    call *that* the command. Getting this wrong is not a harmless miss.
+    `SHA=$(sha256sum pkg/wire_gen.go | cut -f1)` would come out as
+    `pkg/wire_gen.go`, an argument from inside the substitution, and decline
+    for a reason that is not true — which costs the same trust a false positive
+    does.
+
+    The assignments are handed back rather than dropped because a value can
+    contain a command: see `_prefix_opacity`.
+    """
+    assignments: list[str] = []
+    i = 0
+    while i < len(toks):
+        if not _ASSIGNMENT.match(toks[i]):
+            return assignments, toks[i:]
+        word = toks[i]
+        while not _is_whole_word(word):
+            i += 1
+            if i >= len(toks):
+                # Never closed: it runs to the end of the line and takes the
+                # command position with it.
+                assignments.append(word)
+                return assignments, []
+            word += " " + toks[i]
+        assignments.append(word)
+        i += 1
+    return assignments, []
+
+
+def _is_whole_word(tok: str) -> bool:
+    """Whether a token closes everything it opens.
+
+    Whitespace inside `$( )`, `( )` or a pair of backticks does not end a word
+    in a shell, and it does end one here, so a token can be the front half of
+    one. Both spellings turn up in real workflows: `SHA=$(sha256sum f | cut
+    -f1)` is a substitution and `FLAGS=(-l "release/latest")` is an array, and
+    in each the next token is part of this word rather than the command.
+
+    Quoted parentheses are text: `MSG="(draft)"` is a whole word.
+    """
+    depth, backticks, quote = 0, 0, None
+    for ch in tok:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "`":
+            backticks += 1
+    return depth == 0 and backticks % 2 == 0
+
+
+def _substitutions(text: str) -> list[str]:
+    """The interiors of the `$( )` and backtick substitutions in some text.
+
+    Single quotes suppress both; double quotes do not, which is why only the
+    single-quoted runs are skipped. An unclosed one runs to the end of the
+    text, which is what `_split_assignments` hands over after a `$(` that the
+    command-splitter cut in half at a pipe.
+    """
+    out: list[str] = []
+    i, quoted = 0, False
+    while i < len(text):
+        ch = text[i]
+        if quoted:
+            quoted = ch != "'"
+            i += 1
+            continue
+        if ch == "'":
+            quoted = True
+            i += 1
+            continue
+        if text[i : i + 2] == "$(":
+            depth, j = 1, i + 2
+            while j < len(text) and depth:
+                depth += (text[j] == "(") - (text[j] == ")")
+                j += 1
+            out.append(text[i + 2 : j - 1] if depth == 0 else text[i + 2 :])
+            i = j
+            continue
+        if ch == "`":
+            j = text.find("`", i + 1)
+            out.append(text[i + 1 :] if j == -1 else text[i + 1 : j])
+            i = len(text) if j == -1 else j + 1
+            continue
+        i += 1
+    return out
+
+
+def _prefix_opacity(assignments: list[str]) -> str | None:
+    """Why the assignments in front of a command end the analysis, if they do.
+
+    `DENO_VERSION=$(./deno -V)` runs `./deno`. A substitution is a command
+    position like the right-hand side of a pipe, and the same rule applies to
+    it: a local executable or an interpreter in there could append to the
+    output file before the assignment ever happens. `SHA=$(git rev-parse HEAD)`
+    is left alone, because `git` will not go looking.
+    """
+    for word in assignments:
+        for inner in _substitutions(word):
+            for cmd in _split_commands(_strip_comment(inner)):
+                nested, toks = _split_assignments(_tokens(cmd))
+                reason = _opacity(toks) or _prefix_opacity(nested)
+                if reason:
+                    return reason
+    return None
+
+
 def _unquote(tok: str) -> str:
     if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\"":
         return tok[1:-1]
@@ -343,7 +493,7 @@ def scan_script(script: str, shell: str | None) -> Writes:
                     break
                 body.append(lines[i])
                 i += 1
-            toks = _tokens(opener)
+            assignments, toks = _split_assignments(_tokens(opener))
             if _redirects_to_output(toks):
                 placed += opener.count("GITHUB_OUTPUT")
                 if not closed:
@@ -356,7 +506,7 @@ def scan_script(script: str, shell: str | None) -> Writes:
             # command like any other. `python3 - <<'EOF'` is how transformers
             # sets three outputs, and skipping the opacity check here read the
             # whole thing as a step that writes nothing.
-            reason = _opacity(toks)
+            reason = _opacity(toks) or _prefix_opacity(assignments)
             if reason:
                 writes.opaque = reason
                 return writes
@@ -377,6 +527,16 @@ def scan_script(script: str, shell: str | None) -> Writes:
             if not toks:
                 continue
             total += cmd.count("GITHUB_OUTPUT")
+            # Counted first, then narrowed to the command: `OUT=$GITHUB_OUTPUT`
+            # is a mention that has to be accounted for even though it leaves
+            # nothing to run.
+            assignments, toks = _split_assignments(toks)
+            reason = _prefix_opacity(assignments)
+            if reason:
+                writes.opaque = reason
+                return writes
+            if not toks:
+                continue
             name = _unquote(toks[0]).rsplit("/", 1)[-1]
 
             if toks[0].startswith("${{") or name.startswith("${{"):
@@ -467,7 +627,18 @@ def _opacity(toks: list[str]) -> str | None:
 
 def _looks_like_path(tok: str) -> bool:
     """Whether a command is a file in this repository rather than a utility."""
+    quoted = len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\""
     tok = _unquote(tok)
-    if "=" in tok.split("/")[0]:  # a VAR=value prefix, not a command
+    # Anything still shaped like `VAR=value/thing` here got past
+    # `_split_assignments`, so it is not a name a shell would assign to. Still
+    # not a path: `./x.sh` is, `a.b=c/d` is somebody's typo.
+    if "=" in tok.split("/")[0]:
+        return False
+    # A word with a space in it is a word this module's quote tracking lost
+    # its place in, not a filename — `$line" | sed -E 's/.../g'; done)"` came
+    # out of a `$( )` whose pipes were read as though they were not quoted.
+    # Naming that as the command produces a decline for a reason that is not
+    # true. A path that really does contain a space arrives quoted whole.
+    if not quoted and any(ch.isspace() for ch in tok):
         return False
     return tok.startswith(("./", "../", "/")) or "/" in tok

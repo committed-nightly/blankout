@@ -461,6 +461,34 @@ def test_an_interpolated_value_does_not_withhold_wrong_key(repo):
     assert [f.kind for f in report.findings] == [WRONG_KEY]
 
 
+def test_an_env_prefixed_script_is_declined_not_reported(repo):
+    """The whole finding, as it was wrongly produced: a real script, behind a
+    `FOO=bar`, reported as a step that publishes nothing."""
+    repo.write(
+        "release.yml",
+        """
+        name: release
+        on: push
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            outputs:
+              version: ${{ steps.v.outputs.version }}
+            steps:
+              - id: v
+                run: FOO=bar ./release.sh
+          use:
+            needs: build
+            runs-on: ubuntu-latest
+            steps:
+              - run: echo "${{ needs.build.outputs.version }}"
+        """,
+    )
+    report = run(repo)
+    assert report.findings == []
+    assert "./release.sh" in report.undecided[0].reason
+
+
 def test_an_expression_after_a_pipe_is_still_a_command(repo):
     repo.write(
         "ci.yml",
