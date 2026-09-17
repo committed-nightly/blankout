@@ -1,0 +1,169 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest
+
+  dogfood:
+    # Run the tool on this repository, for real. The first two steps are the
+    # easy half. The rest build the cases that matter out of scratch files,
+    # because "it stayed quiet" is only worth asserting next to "it did not
+    # stay quiet when it should not have".
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      - name: actionlint, because this file broke once already
+        # A `${{` inside a comment in a `run:` block is still an expression to
+        # GitHub, and an unbalanced one stops the workflow compiling — no jobs,
+        # no logs, just a failed run. actionlint catches it and blankout does
+        # not, which is the honest division of labour between the two.
+        # SC2016 is ignored because the scratch files below deliberately keep
+        # their `$` unexpanded.
+        run: |
+          curl -sSL -o actionlint.tgz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          tar xzf actionlint.tgz actionlint
+          ./actionlint -ignore 'SC2016'
+
+      - name: our own workflows read no output that is never written
+        run: blankout
+
+      - name: nothing in our own workflows is left undecided
+        run: |
+          blankout > report.txt
+          if grep -q '^not checked:' report.txt; then
+            cat report.txt
+            echo "an output reference in this repository could not be decided"
+            exit 1
+          fi
+
+      # `code=0; cmd || code=$?` rather than `cmd; code=$?`, because these
+      # steps run under `bash -e` and the whole point is to run a command
+      # that exits non-zero.
+      - name: the step that writes nothing is caught, and names the job it skips
+        run: |
+          mkdir -p /tmp/broken/.github/workflows
+          cat > /tmp/broken/.github/workflows/ci.yml <<'YAML'
+          name: CI
+          on: [push]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              outputs:
+                release: ${BRACE} steps.check.outputs.release }}
+              steps:
+                - id: check
+                  run: echo checking
+            publish:
+              needs: build
+              if: needs.build.outputs.release == 'true'
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo publishing
+          YAML
+          # GitHub substitutes expressions in a `run:` block before bash ever
+          # sees it, and a quoted heredoc does not help because the rewrite
+          # happens first. So the braces go in afterwards. This comment cannot
+          # spell the opening delimiter either: GitHub reads comments too, and
+          # an unbalanced one here stops the whole workflow compiling.
+          sed -i 's/\${BRACE}/${''{/' /tmp/broken/.github/workflows/ci.yml
+          grep -qF '${'"{"' steps.check.outputs.release }}' /tmp/broken/.github/workflows/ci.yml \
+            || { cat /tmp/broken/.github/workflows/ci.yml; echo "scratch file was rewritten"; exit 1; }
+
+          code=0; blankout /tmp/broken > /tmp/out.txt || code=$?
+          cat /tmp/out.txt
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          grep -q 'job `publish` is gated on it' /tmp/out.txt \
+            || { echo "the consequence was not reported"; exit 1; }
+
+      - name: a caller-supplied script is declined, not called empty
+        # The false positive found against next.js before this shipped. The
+        # step's script is whatever the caller passed in, so nothing here can
+        # say it writes no outputs.
+        run: |
+          mkdir -p /tmp/reusable/.github/workflows
+          cat > /tmp/reusable/.github/workflows/ci.yml <<'YAML'
+          name: Reusable
+          on:
+            workflow_call:
+              inputs:
+                afterBuild:
+                  type: string
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - id: after
+                  run: ${BRACE} inputs.afterBuild }}
+                - if: steps.after.outputs.passed != ''
+                  run: echo saving
+          YAML
+          sed -i 's/\${BRACE}/${''{/' /tmp/reusable/.github/workflows/ci.yml
+
+          code=0; blankout /tmp/reusable > /tmp/reusable.txt || code=$?
+          cat /tmp/reusable.txt
+          test "$code" -eq 0 || { echo "expected exit 0, got $code"; exit 1; }
+          grep -q '^not checked:' /tmp/reusable.txt \
+            || { echo "declined silently, or did not decline"; exit 1; }
+
+      - name: a script behind a `FOO=bar` is declined, not called empty
+        # The false positive found in review. `FOO=bar ./release.sh` runs
+        # `./release.sh`; the opacity check used to read the first word, and
+        # the first word is the assignment.
+        run: |
+          mkdir -p /tmp/prefixed/.github/workflows
+          cat > /tmp/prefixed/.github/workflows/ci.yml <<'YAML'
+          name: Release
+          on: [push]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              outputs:
+                version: ${BRACE} steps.v.outputs.version }}
+              steps:
+                - id: v
+                  run: FOO=bar ./release.sh
+            use:
+              needs: build
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo ${BRACE} needs.build.outputs.version }}
+          YAML
+          sed -i 's/\${BRACE}/${''{/' /tmp/prefixed/.github/workflows/ci.yml
+
+          code=0; blankout /tmp/prefixed > /tmp/prefixed.txt || code=$?
+          cat /tmp/prefixed.txt
+          test "$code" -eq 0 || { echo "expected exit 0, got $code"; exit 1; }
+          grep -q 'not checked:.*`\./release\.sh`' /tmp/prefixed.txt \
+            || { echo "declined for the wrong reason, or did not decline"; exit 1; }
+
+      - name: a directory with no workflows is an error, not a pass
+        run: |
+          mkdir -p /tmp/empty
+          code=0; blankout /tmp/empty || code=$?
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
