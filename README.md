@@ -118,7 +118,12 @@ It declines when:
   One unnameable write and no key can be proven missing.
 - The script runs an interpreter or a file in your repository — `./release.sh`,
   `make`, `python`, `npm run`. Those inherit `$GITHUB_OUTPUT` and know the
-  protocol, and no redirection would appear here.
+  protocol, and no redirection would appear here. Leading `NAME=value` words are
+  separated off first, so `FOO=bar ./release.sh` is the same command as
+  `./release.sh`; only the words in front count, so `make FOO=bar` still runs
+  `make`. A command inside one of those values counts too — `V=$(./gen.sh)`
+  runs `./gen.sh` — but a command inside an *argument* does not, so
+  `echo "x=$(node y.js)" >> $GITHUB_OUTPUT` is still read as writing `x`.
 - The script mentions `GITHUB_OUTPUT` anywhere the scanner could not place, such
   as `OUT=$GITHUB_OUTPUT`. This is the rule the scanner is built on: every
   occurrence in the script is either a write it understood or a reason to stop.
@@ -178,6 +183,16 @@ positive: next.js runs `run: ${{ inputs.afterBuild }}` inside a reusable
 workflow and reads real outputs from that step. That case is why an expression
 in command position is opaque, and why `never-writes` is withheld from any
 interpolated script.
+
+The second false positive came out of review rather than out of the corpus:
+`FOO=bar ./release.sh` was reported as a step that writes nothing, because the
+opacity check read the first word of the command and the first word was the
+assignment. A shell applies those to the environment and runs what follows, and
+now so does this. Fixing it moved the verdict on 41 of the 3,000 `run:` steps in
+the corpus, and all 41 were read by hand — which is where the line about
+arguments above comes from. Reading substitutions in arguments too would have
+taken thirty steps' keys away rather than twelve, to prevent false positives
+that none of those thirty actually had.
 
 ## Licence
 
