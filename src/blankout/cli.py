@@ -13,6 +13,11 @@ silent failure as a green tick would be a poor joke.
 
 A repository whose workflows read no step outputs is a 0. Plenty of good
 workflows never pass a value between two steps.
+
+Which is why every run ends with a summary line naming what was examined.
+Those last two paragraphs describe two different exit-0 repositories, and
+until the count existed the output could not tell you which one you were
+looking at.
 """
 
 from __future__ import annotations
@@ -58,13 +63,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="findings only; do not list what could not be decided",
+        help=(
+            "do not list what could not be decided; the summary line is still "
+            "printed, because it is the one line a CI gate reads"
+        ),
     )
     return parser
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _summary(report: Report) -> str:
+    """The denominator, printed on every run including the green ones.
+
+    Without it a repository with forty references that all resolve and a
+    repository with no `outputs:` anywhere produce the same three lines, the
+    same exit code and the same JSON. Wording follows `coldcache`, which is
+    the sibling that made the omission obvious.
+    """
+    return (
+        f"{_plural(report.workflows, 'workflow')} checked, "
+        f"{_plural(report.references, 'output reference')}, "
+        f"{_plural(len(report.findings), 'finding')}"
+    )
+
+
 def _text(report: Report, quiet: bool) -> list[str]:
     lines = []
+    if not report.findings:
+        lines.append("Every step output that is read is also written.")
     for finding in report.findings:
         lines.append(f"{finding.path}: {finding.location}")
         lines.append(f"  {finding.expression} {_HEADLINE[finding.kind]}")
@@ -72,23 +101,24 @@ def _text(report: Report, quiet: bool) -> list[str]:
         for consequence in finding.consequences:
             lines.append(f"  -> {consequence}")
         lines.append("")
-    if not quiet:
+    lines.append(_summary(report))
+    if not quiet and report.undecided:
+        lines.append("")
         for undecided in report.undecided:
             lines.append(
                 f"not checked: {undecided.path}: {undecided.location} "
                 f"({undecided.expression}) — {undecided.reason}"
             )
-    if not report.findings and not lines:
-        lines.append("Every step output that is read is also written.")
-    elif not report.findings:
-        lines.insert(0, "Every step output that is read is also written.")
-        lines.insert(1, "")
     return lines
 
 
 def _json(report: Report) -> str:
     return json.dumps(
         {
+            # Same reason as the text summary: `findings: []` on its own does
+            # not say whether anything was examined.
+            "workflows": report.workflows,
+            "references": report.references,
             "findings": [
                 {
                     "kind": f.kind,
