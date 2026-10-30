@@ -19,6 +19,11 @@ run since March" is the thing you needed to know.
 
 Anything that cannot be decided is not a finding. It goes in `undecided` with
 the reason, and the reason is specific enough to act on.
+
+The report also carries how many workflows were read and how many references
+were seen, because the three lists above can all be empty for two unrelated
+reasons — nothing was wrong, or there was nothing of this tool's subject to be
+wrong. Those are not the same result and used to look identical.
 """
 
 from __future__ import annotations
@@ -71,6 +76,14 @@ class Undecided:
 class Report:
     findings: list[Finding] = field(default_factory=list)
     undecided: list[Undecided] = field(default_factory=list)
+    #: Workflow files read.
+    workflows: int = 0
+    #: Every `steps.<id>.outputs.<key>` reference found, counted once per place
+    #: it is written rather than once per distinct key. This is the denominator
+    #: for the two lists above: a repository with no references at all and one
+    #: whose references are all fine are both clean, and only this tells them
+    #: apart. See `_references`.
+    references: int = 0
 
     @property
     def ok(self) -> bool:
@@ -184,11 +197,13 @@ def _consequences(workflow: Workflow, producer: str, output: str) -> list[str]:
 
 def scan(workflows: list[Workflow]) -> Report:
     """Run every check over every workflow."""
-    report = Report()
+    report = Report(workflows=len(workflows))
     for workflow in workflows:
         file_findings: list[Finding] = []
         for job in workflow.jobs.values():
-            for location, step_id, key, written in _references(job):
+            references = _references(job)
+            report.references += len(references)
+            for location, step_id, key, written in references:
                 kind, detail = _verdict(job, step_id, key)
                 if kind is None:
                     if detail:
