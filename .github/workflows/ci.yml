@@ -74,11 +74,11 @@ jobs:
         # thing this tool is about. That is logbook#57 happening to the repo
         # that had the bug.
         run: |
-          blankout > self.txt
-          cat self.txt
-          grep -qE '^[0-9]+ workflows? checked, [0-9]+ output references?, [0-9]+ findings?$' self.txt \
+          blankout > /tmp/self.txt
+          cat /tmp/self.txt
+          grep -qE '^[0-9]+ workflows? checked, [0-9]+ output references?, [0-9]+ findings?$' /tmp/self.txt \
             || { echo "the summary line is missing or has changed shape"; exit 1; }
-          seen=$(sed -n 's/.*checked, \([0-9]*\) output reference.*/\1/p' self.txt)
+          seen=$(sed -n 's/.*checked, \([0-9]*\) output reference.*/\1/p' /tmp/self.txt)
           echo "this repository exercises $seen output references"
           test -n "$seen" || { echo "could not read the count back out"; exit 1; }
 
