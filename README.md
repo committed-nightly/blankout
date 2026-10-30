@@ -38,13 +38,41 @@ point at with `uses: ./...`. No network, no token, no Actions API.
 
 ```
 --json     the same findings, for piping somewhere
---quiet    findings only; do not list what could not be decided
+--quiet    do not list what could not be decided; the summary line stays
 ```
 
 Exit code is 0 when every output that is read is also written, 1 when one is
 not, and 2 when it could not look at all — no workflow directory, a file that
 is not YAML. 2 is not 1 and is very deliberately not 0, because a tool whose
 subject is silent failure should not fail silently.
+
+## What it says it looked at
+
+Every run ends with one line naming the denominator:
+
+```
+3 workflows checked, 12 output references, 0 findings
+```
+
+This matters more than it sounds. These two repositories are both clean, both
+exit 0, and both print *"Every step output that is read is also written"*:
+
+- one has forty output references and every one of them resolves,
+- one has no `outputs:` anywhere.
+
+Without the count they produce identical text and identical JSON, so nothing
+reading the output — a person, a CI gate, a corpus runner — can tell a check
+that passed from a check that had nothing to examine. For a tool whose entire
+subject is failures that look like successes, that was the wrong omission to
+have made. The second number is the fix.
+
+`output references` counts every `steps.<id>.outputs.<key>` written in your
+workflow files, once per place it appears rather than once per distinct key,
+and it is the denominator of the findings and the `not checked:` lines below
+it. `needs.<job>.outputs.<key>` is a different thing and is not counted.
+
+The counts are in `--json` as `workflows` and `references`, and the line is
+printed under `--quiet` too — it is the one line worth reading on a green run.
 
 ## A real example
 
@@ -193,6 +221,16 @@ the corpus, and all 41 were read by hand — which is where the line about
 arguments above comes from. Reading substitutions in arguments too would have
 taken thirty steps' keys away rather than twelve, to prevent false positives
 that none of those thirty actually had.
+
+The summary line came out of the opposite problem: an absence of findings that
+nobody could interpret. Pointed at the 47 vendored project trees on a
+2026-10-30 `ubuntu-latest` runner, this tool returned exit 0 on all 47 — and
+only **3** of them contain a single `steps.*.outputs.*` reference, 16 between
+them. Across the 120 workflow files in those trees, 5 contain one. So 44 of
+those 47 green results were a check reporting success over none of its own
+subject, and the output said exactly the same thing for all 47. The counts are
+what make the difference visible, and are what let `stockbox`'s `exercised`
+floor fail a corpus that looks fully covered and is not.
 
 ## Licence
 

@@ -62,6 +62,69 @@ jobs:
             exit 1
           fi
 
+      - name: the summary line is present and machine-readable
+        # It has to be both, because `stockbox`'s `exercised` floor reads the
+        # middle number out of it with a regex to decide whether an input
+        # contained this tool's subject at all. If the shape of this line
+        # changes, that floor silently starts measuring nothing.
+        #
+        # Worth recording what adding it revealed: this repository's own
+        # workflows contain no `steps.*.outputs.*` reference whatsoever, so
+        # the two steps above have always been a clean sweep over none of the
+        # thing this tool is about. That is logbook#57 happening to the repo
+        # that had the bug.
+        run: |
+          blankout > /tmp/self.txt
+          cat /tmp/self.txt
+          grep -qE '^[0-9]+ workflows? checked, [0-9]+ output references?, [0-9]+ findings?$' /tmp/self.txt \
+            || { echo "the summary line is missing or has changed shape"; exit 1; }
+          seen=$(sed -n 's/.*checked, \([0-9]*\) output reference.*/\1/p' /tmp/self.txt)
+          echo "this repository exercises $seen output references"
+          test -n "$seen" || { echo "could not read the count back out"; exit 1; }
+
+      - name: a clean sweep and an empty one are not the same output
+        # The assertion logbook#57 failed. Both of these are genuinely clean
+        # and both are exit 0 -- that part is correct and is left alone. What
+        # was missing was anything in the output telling you which you got.
+        run: |
+          mkdir -p /tmp/resolved/.github/workflows /tmp/none/.github/workflows
+          cat > /tmp/resolved/.github/workflows/ci.yml <<'YAML'
+          name: CI
+          on: [push]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              outputs:
+                v: ${BRACE} steps.m.outputs.version }}
+              steps:
+                - id: m
+                  run: echo "version=1" >> $GITHUB_OUTPUT
+          YAML
+          sed -i 's/\${BRACE}/${''{/' /tmp/resolved/.github/workflows/ci.yml
+
+          cat > /tmp/none/.github/workflows/ci.yml <<'YAML'
+          name: CI
+          on: [push]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - run: make test
+          YAML
+
+          blankout /tmp/resolved > /tmp/resolved.txt
+          blankout /tmp/none > /tmp/none.txt
+          cat /tmp/resolved.txt /tmp/none.txt
+
+          if cmp -s /tmp/resolved.txt /tmp/none.txt; then
+            echo "both cases produced byte-identical output -- the count is not doing its job"
+            exit 1
+          fi
+          grep -qF '1 output reference,' /tmp/resolved.txt \
+            || { echo "a reference that resolves was not counted"; exit 1; }
+          grep -qF '0 output references,' /tmp/none.txt \
+            || { echo "a repository with no references did not report zero"; exit 1; }
+
       # `code=0; cmd || code=$?` rather than `cmd; code=$?`, because these
       # steps run under `bash -e` and the whole point is to run a command
       # that exits non-zero.
